@@ -1,0 +1,181 @@
+# Fusion X-Port — host development build (PC, SDL3 + zlib)
+#
+# Lets you develop and test the runtime on your desktop before shipping to
+# the 3DS.  Requires SDL3 and zlib development packages.
+#
+#   make -f Makefile.host          # build the runtime binary (./fxp_host)
+#   make -f Makefile.host test     # build + run the MFA round-trip tests
+#
+# Override detection if pkg-config cannot find SDL3, e.g.:
+#   make -f Makefile.host SDL3_CFLAGS="-I/opt/sdl3/include" \
+#                        SDL3_LIBS="-L/opt/sdl3/lib -lSDL3"
+#
+# Note: the host build never references 3ds headers.  The 3DS device layer
+# (source/platform/platform_3ds.c) is NOT compiled here at all — its whole
+# body is guarded by FXP_PLATFORM_3DS, and the desktop device layer
+# (platform_desktop.c) provides the fxp_platform_device_* hooks instead.
+# Recipes use real TAB characters (GNU make rejects spaces).
+
+CC      ?= cc
+CFLAGS  ?= -O2 -g -Wall -Wextra -Werror -std=gnu99
+BUILD   := build_host
+
+SDL3_CFLAGS ?= $(shell pkg-config --cflags sdl3 2>/dev/null)
+SDL3_LIBS   ?= $(shell pkg-config --libs sdl3 2>/dev/null || echo -lSDL3)
+
+CORE_SRCS := \
+source/byte_reader.c \
+source/value.c \
+source/selector.c \
+source/object.c \
+source/frame.c \
+source/movement.c \
+source/event_runtime.c \
+source/mfa_image.c \
+source/mfa_events.c \
+source/mfa_objects.c \
+source/mfa_reader.c \
+source/audio_decode.c
+
+APP_SRCS := \
+source/app.c \
+source/render_sdl3.c \
+source/audio_sdl3.c \
+source/platform/platform.c \
+source/platform/platform_desktop.c
+
+CORE_OBJS := $(patsubst source/%.c,$(BUILD)/%.o,$(CORE_SRCS))
+APP_OBJS  := $(patsubst source/%.c,$(BUILD)/%.o,$(APP_SRCS))
+MAIN_OBJ  := $(BUILD)/main.o
+TEST_OBJ  := $(BUILD)/test_mfa_reader.o
+INPUT_OBJ := $(BUILD)/make_input_mfa.o
+PHASE_OBJ := $(BUILD)/test_phase0.o
+USER_OBJ  := $(BUILD)/test_user_game.o
+MVT_OBJ   := $(BUILD)/test_movement.o
+SCRL_OBJ  := $(BUILD)/test_scroll.o
+AUDIO_OBJ := $(BUILD)/test_audio_decode.o
+DUMP_OBJ  := $(BUILD)/dump_mfa.o
+
+CPPFLAGS += -Iinclude $(SDL3_CFLAGS)
+LDLIBS   += $(SDL3_LIBS) -lz -lm
+# Core objects never reference SDL — tools/tests link without -lSDL3 so the
+# battery runs on machines without SDL3 (the runtime binary still needs it).
+CORE_LDLIBS := -lz -lm
+
+all: $(BUILD)/fxp_host
+
+# Full battery incl. the SDL3 app-level e2e; needs real SDL3 + zlib.
+test: all $(BUILD)/test_mfa_reader $(BUILD)/make_input_mfa $(BUILD)/test_phase0 $(BUILD)/test_user_game $(BUILD)/test_audio_decode
+	@echo "== running MFA reader round-trip tests =="
+	$(BUILD)/test_mfa_reader
+	@echo "== running input-event round-trip tests =="
+	$(BUILD)/make_input_mfa
+	@echo "== running phase-0 regression tests =="
+	$(BUILD)/test_phase0
+	@echo "== running real-Fusion-MFA e2e tests (eventest) =="
+	$(BUILD)/test_user_game
+	@echo "== running audio decoder tests (WAV/MP3/OGG) =="
+	$(BUILD)/test_audio_decode
+
+# Core tests only — no SDL3 needed (used in CI/containers without SDL3).
+test-core: $(BUILD)/test_mfa_reader $(BUILD)/make_input_mfa $(BUILD)/test_phase0 $(BUILD)/test_user_game $(BUILD)/test_movement $(BUILD)/test_scroll $(BUILD)/test_audio_decode $(BUILD)/dump_mfa
+	@echo "== running MFA reader round-trip tests =="
+	$(BUILD)/test_mfa_reader
+	@echo "== running input-event round-trip tests =="
+	$(BUILD)/make_input_mfa
+	@echo "== running phase-0 regression tests =="
+	$(BUILD)/test_phase0
+	@echo "== running real-Fusion-MFA e2e tests (eventest) =="
+	$(BUILD)/test_user_game
+	@echo "== running movement engine tests (bouncing ball, 8 dir) =="
+	$(BUILD)/test_movement
+	@echo "== running camera scroll tests (center display, coefficients) =="
+	$(BUILD)/test_scroll
+	@echo "== running audio decoder tests (WAV/MP3/OGG) =="
+	$(BUILD)/test_audio_decode
+
+app-e2e: $(BUILD)/fxp_host
+	@echo "== running app-level input e2e (hold DOWN -> mover descends) =="
+	FXP_INPUT_MFA=/tmp/fxp_input.mfa $(BUILD)/make_input_mfa >/dev/null
+	FXP_HOLD_KEY=40:5:99999 FXP_SNAPSHOT=25 \
+	        SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+	        $(BUILD)/fxp_host /tmp/fxp_input.mfa >/dev/null
+	cp /tmp/fxp_snapshot.ppm /tmp/fxp_snap_a.ppm
+	FXP_HOLD_KEY=40:5:99999 FXP_SNAPSHOT=90 \
+	        SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+	        $(BUILD)/fxp_host /tmp/fxp_input.mfa >/dev/null
+	@if cmp -s /tmp/fxp_snap_a.ppm /tmp/fxp_snapshot.ppm; then \
+	        echo "  FAIL: mover did not move (identical snapshots)"; exit 1; \
+	else \
+	        echo "  ok: snapshots differ -> input reached interpreter + renderer"; \
+	fi
+
+CORE_HDRS := $(wildcard include/fxp/*.h)
+
+$(BUILD):
+	mkdir -p $(BUILD)
+
+$(BUILD)/platform:
+	mkdir -p $(BUILD)/platform
+
+$(BUILD)/%.o: source/%.c $(CORE_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+$(BUILD)/platform/%.o: source/platform/%.c $(CORE_HDRS) | $(BUILD) $(BUILD)/platform
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+$(BUILD)/test_mfa_reader.o: tests/test_mfa_reader.c $(CORE_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+$(BUILD)/make_input_mfa.o: tools/make_input_mfa.c $(CORE_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+$(BUILD)/test_phase0.o: tests/test_phase0.c $(CORE_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+$(BUILD)/test_user_game.o: tests/test_user_game.c $(CORE_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+$(BUILD)/test_movement.o: tests/test_movement.c $(CORE_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+$(BUILD)/test_scroll.o: tests/test_scroll.c $(CORE_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+$(BUILD)/test_audio_decode.o: tools/test_audio_decode.c | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+$(BUILD)/dump_mfa.o: tools/dump_mfa.c $(CORE_HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+$(BUILD)/fxp_host: $(CORE_OBJS) $(APP_OBJS) $(MAIN_OBJ)
+	$(CC) $^ -o $@ $(LDFLAGS) $(LDLIBS)
+
+$(BUILD)/test_mfa_reader: $(CORE_OBJS) $(TEST_OBJ)
+	$(CC) $^ -o $@ $(LDFLAGS) $(CORE_LDLIBS)
+
+$(BUILD)/make_input_mfa: $(CORE_OBJS) $(INPUT_OBJ)
+	$(CC) $^ -o $@ $(LDFLAGS) $(CORE_LDLIBS)
+
+$(BUILD)/test_phase0: $(CORE_OBJS) $(PHASE_OBJ)
+	$(CC) $^ -o $@ $(LDFLAGS) $(CORE_LDLIBS)
+
+$(BUILD)/test_user_game: $(CORE_OBJS) $(USER_OBJ)
+	$(CC) $^ -o $@ $(LDFLAGS) $(CORE_LDLIBS)
+
+$(BUILD)/test_movement: $(CORE_OBJS) $(MVT_OBJ)
+	$(CC) $^ -o $@ $(LDFLAGS) $(CORE_LDLIBS)
+
+$(BUILD)/test_scroll: $(CORE_OBJS) $(SCRL_OBJ)
+	$(CC) $^ -o $@ $(LDFLAGS) $(CORE_LDLIBS)
+
+$(BUILD)/test_audio_decode: $(BUILD)/audio_decode.o $(BUILD)/byte_reader.o $(AUDIO_OBJ)
+	$(CC) $^ -o $@ $(LDFLAGS) -lm
+
+$(BUILD)/dump_mfa: $(CORE_OBJS) $(DUMP_OBJ)
+	$(CC) $^ -o $@ $(LDFLAGS) $(CORE_LDLIBS)
+
+clean:
+	rm -rf $(BUILD)
+
+.PHONY: all test test-core app-e2e clean
